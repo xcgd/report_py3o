@@ -5,7 +5,7 @@ import requests
 from py3o.template import Template
 
 from openerp.report.report_sxw import report_sxw
-from openerp import osv
+from openerp.osv import osv
 from openerp import pooler
 
 
