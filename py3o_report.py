@@ -1,11 +1,12 @@
 from base64 import b64decode
 from tempfile import NamedTemporaryFile
 
-from openerp.report.report_sxw import *
-
+import requests
 from py3o.template import Template
 
-import requests
+from openerp.report.report_sxw import report_sxw
+from openerp.osv import osv
+from openerp import pooler
 
 
 class py3o_report(report_sxw):
@@ -43,9 +44,11 @@ class py3o_report(report_sxw):
         # Find the report definition to get its settings.
         pool = pooler.get_pool(cr.dbname)
         report_xml_obj = pool.get('ir.actions.report.xml')
-        report_xml_ids = report_xml_obj.search(cr, uid,
-                                               [('report_name', '=', self.name[7:])], # Ignore "report."
-                                               context=context)
+        report_xml_ids = report_xml_obj.search(
+            cr, uid,
+            [('report_name', '=', self.name[7:])],  # Ignore "report."
+            context=context,
+        )
         if not report_xml_ids:
             return super(py3o_report, self).create(cr, uid, ids, data,
                                                    context=context)
@@ -53,44 +56,69 @@ class py3o_report(report_sxw):
                                            report_xml_ids[0],
                                            context=context)
 
-        template = report_xml.py3o_template_id
+        tmpl_def = report_xml.py3o_template_id
         filetype = report_xml.py3o_fusion_filetype
 
         # py3o.template operates on filenames so create temporary files.
-        with NamedTemporaryFile(suffix='.odt', prefix='py3o-template-') as in_temp:
+        with NamedTemporaryFile(
+            suffix='.odt', prefix='py3o-template-'
+        ) as in_temp, NamedTemporaryFile(
+            suffix='.odt',
+            prefix='py3o-report-'
+        ) as out_temp:
 
-            in_temp.write(b64decode(template.py3o_template_data))
+            in_temp.write(b64decode(tmpl_def.py3o_template_data))
             in_temp.flush()
             in_temp.seek(0)
 
-            template = Template(in_temp.name, None)
+            datadict = self.get_values(cr, uid, ids, data, context)
 
-            user_instruction_mapping = template.get_user_instructions_mapping()
-            values = user_instruction_mapping.jsonify(
-                self.get_values(cr, uid, ids, data, context)
-            )
+            template = Template(in_temp.name, out_temp.name)
+            template.render(datadict)
+            out_temp.seek(0)
 
-            fusion_server_obj = pool['py3o.server']
-            fusion_server_id = fusion_server_obj.search(
-                cr, uid, [], context=context
-            )[0]
-            fusion_server = fusion_server_obj.browse(
-                cr, uid, fusion_server_id, context=context
-            )
-            files = {
-                'tmpl_file': in_temp,
-            }
-            fields = {
-                "targetformat": filetype.fusion_ext,
-                "datadict": values,
-                "image_mapping": "{}",
-            }
-            r = requests.post(fusion_server.url, data=fields, files=files)
-            chunk_size = 1024
-            with NamedTemporaryFile(
-                    suffix=filetype.human_ext,
-                    prefix='py3o-template-') as fd:
-                for chunk in r.iter_content(chunk_size):
-                    fd.write(chunk)
-                fd.seek(0)
-                return fd.read(), filetype.human_ext
+            # TODO: use py3o.formats to know native formats instead
+            # of hardcoding this value
+            # TODO: why use the human readable form when you're a machine?
+            # this is non-sense AND dangerous... please use technical name
+            if filetype.human_ext != 'odt':
+                # Now we ask fusion server to convert our template
+                fusion_server_obj = pool.get('py3o.server')
+                fusion_server_id = fusion_server_obj.search(
+                    cr, uid, [], context=context
+                )[0]
+                fusion_server = fusion_server_obj.browse(
+                    cr, uid, fusion_server_id, context=context
+                )
+                files = {
+                    'tmpl_file': out_temp,
+                }
+                fields = {
+                    "targetformat": filetype.fusion_ext,
+                    "datadict": "{}",
+                    "image_mapping": "{}",
+                    "skipfusion": True,
+                }
+                # Here is a little joke about Odoo
+                # we do nice chunked reading from the network...
+                r = requests.post(fusion_server.url, data=fields, files=files)
+                if r.status_code == 400:
+                    # server says we have an issue... let's tell that to enduser
+                    raise osv.except_osv(
+                        _('Fusion server error'),
+                        r.json(),
+                    )
+
+                else:
+                    chunk_size = 1024
+                    with NamedTemporaryFile(
+                        suffix=filetype.human_ext,
+                        prefix='py3o-template-'
+                    ) as fd:
+                        for chunk in r.iter_content(chunk_size):
+                            fd.write(chunk)
+                        fd.seek(0)
+                        # ... but odoo wants the whole data in memory anyways :)
+                        return fd.read(), filetype.human_ext
+
+            return out_temp.read(), 'odt'
