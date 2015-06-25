@@ -7,6 +7,7 @@ from py3o.template import Template
 from openerp.report.report_sxw import report_sxw
 from openerp.osv import osv
 from openerp import pooler
+from openerp.tools.translate import _
 
 
 class py3o_report(report_sxw):
